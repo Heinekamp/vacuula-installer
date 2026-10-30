@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import resources
 from zoneinfo import ZoneInfo
 
 
@@ -224,3 +227,69 @@ def timezone_offsets(timezone_name):
     summer = datetime(2026, 7, 15, tzinfo=tz)
 
     return f"{fmt(winter)}{fmt(summer)}"
+
+
+# POSIX TZ footer of a tzdata file, e.g. "CET-1CEST,M3.5.0,M10.5.0/3" or "<+04>-4"
+_TZ_NAME = r"(?:<[^>]*>|[A-Za-z]+)"
+_TZ_OFFSET = r"[+-]?\d{1,2}(?::\d{2}){0,2}"
+_TZ_FOOTER_RE = re.compile(rf"^{_TZ_NAME}({_TZ_OFFSET})(?:{_TZ_NAME}({_TZ_OFFSET})?(,.+))?$")
+# the rule ends up in a shell command on the robot, so only allow plain characters
+_ROBOT_TZ_SAFE_RE = re.compile(r"^[A-Za-z0-9:,./+-]+$")
+# UTCOFFSET is only known to work up to 68 chars, init.sh appends ";{ /emmc/vacuula/vacuula.sh start_mod &}" (40)
+MAX_ROBOT_TZ_LEN = 68 - 40
+
+
+def _parse_tz_offset(offset: str) -> int:
+    sign = -1 if offset.startswith("-") else 1
+    parts = [int(p) for p in offset.lstrip("+-").split(":")]
+    return sign * sum(p * 60 ** (2 - i) for i, p in enumerate(parts))
+
+
+def _fmt_tz_offset(seconds: int) -> str:
+    sign = "-" if seconds < 0 else ""
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    out = f"{sign}{hours}"
+    if minutes or secs:
+        out += f":{minutes:02d}"
+    if secs:
+        out += f":{secs:02d}"
+    return out
+
+
+def robot_tz_rule(timezone_name: str) -> str | None:
+    """Full POSIX TZ string for the robot, with DST transition dates, e.g.
+    "STD-1DST-2,M3.5.0,M10.5.0/3" for Europe/Berlin.
+
+    The utc_offset sent on provisioning only holds the two offsets ("STD-1:00DST-2:00"),
+    without transition dates the robot falls back to US DST dates. The rule is taken from
+    the footer of the tzdata file, zone abbreviations are replaced by STD/DST since names
+    like "<+04>" would break the shell command. VACUULA_ROBOT_TZ overrides it (for testing).
+    Returns None if there is no usable rule."""
+    rule = os.environ.get("VACUULA_ROBOT_TZ")
+    if not rule:
+        *dirs, name = timezone_name.split("/")
+        data = resources.files(".".join(["tzdata.zoneinfo", *dirs])).joinpath(name).read_bytes()
+        footer = data.rstrip(b"\n").rsplit(b"\n", 1)[-1].decode("ascii")
+        m = _TZ_FOOTER_RE.match(footer)
+        if not m:
+            logger.warning("no usable POSIX TZ footer for %s: %r", timezone_name, footer)
+            return None
+        std_offset, dst_offset, transitions = m.groups()
+        std = _parse_tz_offset(std_offset)
+        rule = f"STD{_fmt_tz_offset(std)}"
+        if transitions:
+            # tzdata leaves out the DST offset when it is one hour ahead, always spell it out like the firmware does
+            dst = _parse_tz_offset(dst_offset) if dst_offset else std - 3600
+            rule += f"DST{_fmt_tz_offset(dst)}{transitions}"
+        # transition times outside 0..24h (e.g. Asia/Jerusalem "/26") are an extension the robot may not parse
+        if any(not 0 <= int(h) <= 24 for h in re.findall(r"/(-?\d+)", transitions or "")):
+            logger.warning("timezone rule %r for %s uses extended transition times, not sending it", rule, timezone_name)
+            return None
+    if not _ROBOT_TZ_SAFE_RE.match(rule):
+        logger.warning("robot timezone rule %r contains unsupported characters, ignoring it", rule)
+        return None
+    if len(rule) > MAX_ROBOT_TZ_LEN:
+        logger.warning("robot timezone rule %r is longer than %d chars, not sending it", rule, MAX_ROBOT_TZ_LEN)
+        return None
+    return rule

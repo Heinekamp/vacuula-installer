@@ -57,6 +57,17 @@ log "$(qdbc -d /dev/qdb/robotdb "SELECT * FROM CloudServiceLevel")"
 log "Setting UTCOFFSET to execute vacuula on boot"
 VALUE=$(qdbc -f data -d /dev/qdb/systemdb "SELECT Value FROM StringSettings WHERE Name='UTCOFFSET';")
 OFFSET="${VALUE%%;*}"
+# the offset from provisioning has no DST dates (robot would switch on US dates), use the full rule if the installer sent one
+TZ_RULE="$(sed -n '3p' /emmc/vacuula/config)"
+case "$TZ_RULE" in
+    ""|*[!A-Za-z0-9:,./+-]*)
+        log "No usable timezone rule in config, keeping $OFFSET"
+        ;;
+    *)
+        log "Using timezone rule $TZ_RULE instead of $OFFSET"
+        OFFSET="$TZ_RULE"
+        ;;
+esac
 NEW_OFFSET="$OFFSET;{ /emmc/vacuula/vacuula.sh start_mod &}"
 qdbc -d /dev/qdb/systemdb "INSERT OR REPLACE INTO StringSettings( Name, Value ) VALUES ( 'UTCOFFSET', '$NEW_OFFSET' );" || true
 NEW_VALUE=$(qdbc -f data -d /dev/qdb/systemdb "SELECT Value FROM StringSettings WHERE Name='UTCOFFSET';")

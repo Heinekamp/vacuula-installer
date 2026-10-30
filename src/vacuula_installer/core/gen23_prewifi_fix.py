@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from os import mkdir
+import logging
 import tarfile
 import tempfile
 import threading
@@ -11,9 +12,12 @@ import usb.core  # type: ignore[reportMissingTypeStubs]
 from PySide6.QtCore import QObject, Signal
 
 from vacuula_installer.constants import GEN3_DEFAULT_PORT, SCRIPTS_DIR
+from vacuula_installer.core.gen23_provisioner import robot_tz_rule
 from vacuula_installer.core.neato_blast import upload_file
 from vacuula_installer.core.robot_detector import RobotDetector
 from vacuula_installer.core.session import SessionData
+
+logger = logging.getLogger(__name__)
 
 def _arm_movw(rd: int, value: int) -> bytes:
     """ARM (A1) 'MOVW Rd, #imm16' little-endian: imm12[7:0], Rd|imm12[11:8], imm4, 0xE3"""
@@ -170,10 +174,18 @@ class Gen23WiFiFixer(QObject):
         # additional info
         ip = session.server_ip
         gen3_port = session.gen3_port or GEN3_DEFAULT_PORT
+        tz_rule = None
+        if session.timezone:
+            try:
+                tz_rule = robot_tz_rule(session.timezone)
+            except Exception:
+                logger.exception("timezone rule lookup failed, robot keeps the plain utc offset")
+        logger.debug("robot timezone rule for %s: %s", session.timezone, tz_rule)
         config_path = tmp_dir / "config"
-        config_path.write_bytes(f"{ip}\n{gen3_port}\n".encode())
+        config_path.write_bytes(f"{ip}\n{gen3_port}\n{tz_rule or ''}\n".encode())
         # line 1: ip
         # line 2: port
+        # line 3: POSIX TZ rule with DST dates (empty = keep the utc offset from provisioning)
 
         patch_files = gen3_port_patch_files(gen3_port)
         port_patch_dir = tmp_dir / "port_patch"
